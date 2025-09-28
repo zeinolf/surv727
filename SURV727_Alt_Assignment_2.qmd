@@ -1,0 +1,295 @@
+---
+title: "Alternative Assignment 2"
+author: "Zach Einolf"
+date: "09/30/2025"
+format: pdf
+editor: visual
+---
+
+You may work in pairs or individually for this assignment. Make sure you join a group in Canvas if you are working in pairs. Turn in this assignment as an HTML or PDF file to ELMS. Make sure to include the R Markdown or Quarto file that was used to generate it.
+
+```{r}
+#| message: FALSE
+library(tidyverse)
+library(epidatr)
+library(censusapi)
+library(tidycensus)
+```
+
+In this assignment, you will pull from APIs to get data from various data sources and use your data wrangling skills to use them all together. You should turn in a report in PDF or HTML format that addresses all of the questions in this assignment, and describes the data that you pulled and analyzed. You do not need to include full introduction and conclusion sections like a full report, but you should make sure to answer the questions in paragraph form, and include all relevant tables and graphics.
+
+Whenever possible, use piping and `dplyr`. Avoid hard-coding any numbers within the report as much as possible.
+
+## Pulling from APIs
+
+Our first data source is the Delphi COVIDcast data. You can access this using the Epidata API built by Carnegie Mellon University's Delphi Research group. Documentation for this API can be found here: <https://cmu-delphi.github.io/delphi-epidata/>. Here, we find the smoothed estimate of the proportion of people experiencing Covid-like symptoms by county from April 1, 2020 to April 14, 2020.
+
+```{r}
+covid <- pub_covidcast('fb-survey', 
+                       'smoothed_wcli', 
+                       'county', 
+                       'day', 
+                       time_values = c(20200401:20200414))
+head(covid)
+```
+
+For more information about the data, see: <https://cmu-delphi.github.io/delphi-epidata/api/covidcast_signals.html>
+
+Answer the following questions:
+
+-   **Change the data from long to wide format by including the estimate of Covid-like symptoms for each day as a column. There should be a column for `geo_value` as well as a column for each of the days in the dataset.**
+
+    ```{r}
+    covid_wide <- covid|>
+      pivot_wider(id_cols = geo_value,
+                  names_from = time_value, 
+                  values_from = value,
+                  values_fill = 0)|>
+      arrange(geo_value)
+
+    covid_wide
+    ```
+
+-   **Find the mean, median, and variance of the estimate on each of the days from April 6, 2020 to April 14, 2020. (Note that this is not the appropriate way of finding the overall measures in reality because we aren't using weights)**
+
+    ```{r}
+    covid |>
+      group_by(time_value) |>
+      summarize(
+        mean= mean(value, na.rm = TRUE),
+        median= median(value, na.rm = TRUE),
+        var= var(value, na.rm = TRUE)
+      )
+    ```
+
+-   **Which counties had the highest report Covid-like symptoms on each of the days within this range?**
+
+    ```{r}
+    library(fipio)
+
+    highest_cli <- covid |>
+      group_by(time_value) |>
+      filter(value == max(value, na.rm = TRUE)) |>
+      mutate(county_name=fips_county(geo_value))|>
+      select(time_value, county_name, geo_value, value) |>
+      arrange(time_value)
+
+    highest_cli
+
+
+    ```
+
+    Bronx, Rockland, and Putnam Counties in New York had the highest Covid-like symptoms reported within this time frame.
+
+**Using the API, get the actual COVID cases from the JHU Cases and Deaths (using the link above, `confirmed_7dav_incidence_prop`) from May 6, 2020 to May 14, 2020. This is the number of confirmed COVID cases per 100,000 people. Find the correlation between reported COVID-like symptoms and actual COVID cases per 100,000 people within each county a month later. Is there a relationship?**
+
+```{r}
+cases_may <- pub_covidcast('jhu-csse', 
+                       'confirmed_7dav_incidence_prop', 
+                       'county', 
+                       'day', 
+                       time_values = c(20200506:20200514))
+
+mean_cli<- covid |>
+  group_by(geo_value) |>
+  summarise(mean_cli = mean(value, na.rm = TRUE),
+            .groups = "drop")
+
+mean_cases<- cases_may |>
+  group_by(geo_value) |>
+  summarise(mean_cases = mean(value, na.rm = TRUE),
+            .groups = "drop")
+
+joined<- inner_join(mean_cli, mean_cases, by = "geo_value")
+
+with(joined, cor.test(mean_cli, mean_cases, method = "pearson"))
+
+ggplot(joined, aes(x = mean_cli, y = mean_cases)) +
+  geom_point(alpha = 0.4)+
+  geom_smooth(method = "lm") +
+  theme_minimal()
+
+```
+
+The correlation test and plot shows a very small but statistically significant positive relationship, indicating that higher reported COVID-like symptoms in April were associated with a slight increase in confirmed cases per 100,000 people in May.
+
+## Covidcast API Data + ACS
+
+Now lets add another data set. The `censusapi` package provides a nice R interface for communicating with this API. However, before running queries we need an access key. This (easy) process can be completed here:
+
+<https://api.census.gov/data/key_signup.html>
+
+Once you have an access key, save it as a text file, then read this key in the `cs_key` object. We will use this object in all following API queries. Note that I called my text file `census-key.txt` – yours might be different!
+
+```{r}
+cs_key <- read_file("/Users/test/surv727/einolf-glaser-wenner-a1/census-key.txt")
+```
+
+You can navigate through the documentation for all Census Data APIs here: <https://www.census.gov/data/developers/data-sets.html> Documentation for the 5-year ACS API can be found here: <https://www.census.gov/data/developers/data-sets/acs-5year.html>.
+
+In the following, we request basic socio-demographic information (population, median age, median household income, income per capita) for cities and villages in the state of Illinois. The information about the variables used here can be found here: <https://api.census.gov/data/2022/acs/acs5/variables.html>.
+
+```{r}
+acs <- getCensus(name = "acs/acs5",
+                    vintage = 2020, 
+                    vars = c("NAME", 
+                             "B01001_001E", 
+                             "B06002_001E", 
+                             "B19013_001E", 
+                             "B19301_001E"), 
+                    region = "county", 
+                    key = cs_key)
+head(acs)
+```
+
+Now, it might be useful to rename the socio-demographic variables (`B01001_001E` etc.) in our data set and assign more meaningful names.
+
+```{r}
+acs <-
+  acs %>%
+  rename(pop = B01001_001E, 
+         age = B06002_001E, 
+         hh_income = B19013_001E, 
+         income = B19301_001E)
+```
+
+It seems like we could try to use this location information listed above to merge this data set with the COVID data. However, we first have to clean the geography data to match the two datasets. The COVID data has a five digit geography code, with the first two digits representing the state and the last three representing the county within that state. The ACS data has this separated out. Add a new variable `location` to the ACS data that has the geography value in the same format as the COVID data.
+
+```{r}
+acs_clean <- acs |>
+  mutate(
+    state_code  = str_pad(state, 2, pad = "0"),
+    county_code = str_pad(county, 3, pad = "0"),
+    geo_value = paste0(state_code, county_code)
+  )
+```
+
+Answer the following questions with the COVID data and ACS data.
+
+-   **First, check how many counties aren't matched. Then, create a new data set by joining the two datasets. Keep only counties that appear in both data sets.**
+
+    ```{r}
+    acs_missing <- acs_clean|>
+      anti_join(covid, 'geo_value')|>
+      nrow()
+
+    acs_missing
+
+    covid_missing <- covid|>
+      anti_join(acs_clean, 'geo_value')|>
+      nrow()
+
+    covid_missing
+
+    acs_missing+covid_missing
+
+
+    merged <- inner_join(
+      covid,
+      acs_clean,
+      by = "geo_value")
+
+    head(merged)
+    ```
+
+    There are 2224 counties not matched between datasets.
+
+-   **Compute the mean of the proportion of people with covid-like illness symptoms on April 6, 2020 for counties that have an above average median household income and for those that have an below average median household income. When building your pipe, start with creating the grouping variable and then proceed with the remaining tasks. What conclusions might you draw from this?**
+
+    ```{r}
+    results <- merged |>
+      mutate(
+        income_group = if_else(hh_income > mean(hh_income, na.rm = TRUE),
+                                    "Above Average Income",
+                                    "Below Average Income")) |>
+      filter(time_value == '2020-04-06') |> #I used the 6th here because there is no data from 4/1 to 4/5
+      group_by(income_group) |>
+      summarise(mean_cli = mean(value, na.rm = TRUE),
+                n_counties = n(),
+                .groups = "drop")
+
+    results
+    ```
+
+    From this result, one may draw the conclusion that counties with higher than average median household income experience more COVID-like symptoms in this time period (which was early in the pandemic).
+
+-   **Is there a relationship between the median household income and the proportion of people reporting Covid-like illness symptoms? Describe the relationship and use a scatterplot.**
+
+    ```{r}
+    on_day <-  merged |>
+        filter(time_value == '2020-04-06')
+
+    ggplot(on_day, aes(x = hh_income, y = value)) +
+      geom_point() +
+      geom_smooth(method = "lm", color = "red") +
+      labs(
+        x = "Median Household Income",
+        y = "Proportion Reporting COVID-like Symptoms on April 6, 2020",
+        title = "Relationship Between Household Income and COVID-like Symptoms on 4/6/20"
+      ) +
+      theme_minimal()
+
+
+    cor.test(on_day$hh_income, on_day$value, method = "pearson")
+    ```
+
+Based on the correlation test results and the scatterplot, there is no statistically significant relationship between 2020 county-level median household income and the proportion of residents reporting COVID-like symptoms on April 6, 2020.
+
+## Using Other Census Data
+
+**Suppose we wanted to use the 2020 1-year ACS instead of the 5-year ACS. Why would we be unable to do this?** *Hint: Read the documentation for the 1-year ACS*
+
+The U.S. Census Bureau did not release its standard 1-year estimates from the 2020 American Community Survey (ACS) because of the impacts of the COVID-19 pandemic on data collection. Therefore, we would not be able to use the 2020 1-year ACS data instead of the 5-year ACS for this specific year. ACS-1 also does not report at the level of geographic detail that the ACS-5 does, so there would be some data mismatch in terms of descriptives like counties.
+
+**Instead, repeat the steps above to merge the Google Trends data to the 1-year ACS from 2021 instead. Do the same analysis as above.**
+
+```{r}
+#Assuming Google Trends is a typo for Covidcast API Data
+
+acs1 <- getCensus(name = "acs/acs1",
+                    vintage = 2021, 
+                    vars = c("NAME", 
+                             "B01001_001E", 
+                             "B06002_001E", 
+                             "B19013_001E", 
+                             "B19301_001E"), 
+                    region = "county", 
+                    key = cs_key)
+
+acs1 <-
+  acs1 %>%
+  rename(pop = B01001_001E, 
+         age = B06002_001E, 
+         hh_income = B19013_001E, 
+         income = B19301_001E)
+
+acs1_clean <- acs1 |>
+  mutate(
+    state_code  = str_pad(state, 2, pad = "0"),
+    county_code = str_pad(county, 3, pad = "0"),
+    geo_value = paste0(state_code, county_code)
+  )
+
+merged1 <- inner_join(
+  covid,
+  acs1_clean,
+  by = "geo_value")
+
+on_day1 <-  merged1 |>
+    filter(time_value == '2020-04-06')
+
+ggplot(on_day1, aes(x = hh_income, y = value)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "red") +
+  labs(
+    x = "2021 Median Household Income",
+    y = "Proportion Reporting COVID-like Symptoms on April 6, 2021",
+    title = "Relationship Between 2021 Household Income and COVID-like Symptoms on 4/6/20"
+  ) +
+  theme_minimal()
+
+
+cor.test(on_day1$hh_income, on_day1$value, method = "pearson")
+```
+
+Based on the correlation test results and the scatterplot, there is no statistically significant relationship between 2021 county-level median household income and the proportion of residents reporting COVID-like symptoms on April 6, 2020. This is consistent with the output from the ACS-5 results.
