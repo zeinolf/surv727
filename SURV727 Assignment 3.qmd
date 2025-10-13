@@ -1,0 +1,247 @@
+---
+title: "SURV727 Assignment 3"
+author: "Zach Einolf"
+subtitle: "10/14/2025."
+format: pdf
+editor: visual
+---
+
+You may work in pairs or individually for this assignment. Make sure you join a group in Canvas if you are working in pairs. Turn in this assignment as an HTML or PDF file to ELMS. Make sure to include the R Markdown or Quarto file that was used to generate it. Include the GitHub link for the repository containing these files.
+
+```{r}
+library(xml2)
+library(rvest)
+library(tidyverse)
+```
+
+## Web Scraping
+
+In this assignment, your task is to scrape some information from Wikipedia. We start with the following page about Grand Boulevard, a Chicago Community Area.
+
+<https://en.wikipedia.org/wiki/Grand_Boulevard,_Chicago>
+
+The ultimate goal is to gather the table "Historical population" and convert it to a `data.frame`.
+
+As a first step, read in the html page as an R object. Extract the tables from this object (using the `rvest` package) and save the result as a new object. Follow the instructions if there is an error. Use `str()` on this new object -- it should be a list. Try to find the position of the "Historical population" in this list since we need it in the next step.
+
+```{r}
+url <- "https://en.wikipedia.org/wiki/Grand_Boulevard,_Chicago"
+
+page <- tryCatch(
+  read_html(url),
+  error = function(e) {
+    stop("Could not read the page", 
+         conditionMessage(e))
+  }
+)
+
+
+tables_nodes <- html_elements(page, "table")
+tables <- html_table(tables_nodes, fill = TRUE)
+str(tables, max.level = 1)
+
+```
+
+Extract the "Historical population" table from the list and save it as another object. You can use subsetting via `[[…]]` to extract pieces from a list. Print the result.
+
+```{r}
+captions <- tables_nodes |>
+  map(~ .x |>
+        html_element("caption")|>
+        html_text2()) |>
+  map_chr(~ ifelse(is.na(.x), "", .x))
+
+hist_idx <- which(str_detect(captions, regex("^Historical population$", ignore_case = TRUE)))
+
+historical_raw <- tables[[hist_idx]]
+print(historical_raw)
+```
+
+You will see that the table needs some additional formatting. Keep only want rows and columns with actual values.
+
+```{r}
+historical_clean <- historical_raw[-11, ] |>
+  mutate(
+    year = parse_number(.data[['Census']]),
+    population_count = parse_number(.data[['Pop.']])
+  ) |>
+  filter(!is.na(year), !is.na(population_count)) |>
+  select(year, population_count)
+
+historical_clean
+```
+
+## Expanding to More Pages
+
+That's it for this page. However, we may want to repeat this process for other community areas. The Wikipedia page <https://en.wikipedia.org/wiki/Grand_Boulevard,_Chicago> has a section on "Places adjacent to Grand Boulevard, Chicago" at the bottom. Can you find the corresponding table in the list of tables that you created earlier? Extract this table as a new object.
+
+```{r}
+position <- tables[[3]]
+```
+
+Then, grab the community areas east of Grand Boulevard and save them as a character vector. Print the result.
+
+```{r}
+east_raw <- c(position[[5]], position[[11]], position[[17]])
+
+east <- east_raw |>
+  as.character() |>
+  replace_na("") |>
+  str_split("\\n|•|;|,") |>
+  unlist() |>
+  str_remove_all("\\[[^\\]]*\\]") |>
+  str_remove(",?\\s*Chicago$")|>
+  str_squish() |>
+  discard(~ .x == "")
+
+print(east)
+```
+
+We want to use this list to create a loop that extracts the population tables from the Wikipedia pages of these places. To make this work and build valid urls, we need to replace empty spaces in the character vector with underscores. The resulting vector should look like this: "Oakland,\_Chicago" "Kenwood,\_Chicago" "Hyde_Park,\_Chicago"
+
+```{r}
+east_c <- east |>
+  (\(v) ifelse(str_detect(v, ",\\s*Chicago$"), v, paste0(v, ", Chicago")))() |>
+  str_replace_all("\\s+", "_")
+print(east_c)
+```
+
+Build a loop to grab the population tables from each page. Add columns to the original table using `cbind()`.
+
+```{r}
+get_population_table <- function(page_title) {
+  html <- read_html(paste0("https://en.wikipedia.org/wiki/", page_title))
+  tabs <- html_elements(html, "table")
+  cap_txt <- map_chr(tabs, ~ {
+    cap <- html_element(.x, "caption")
+    if (is.na(cap)) "" else html_text2(cap)
+  })
+  id <- which(str_detect(cap_txt, regex("Historical population", TRUE)))[1]
+  tbl <- html_table(tabs[id], fill = TRUE)[[1]]
+  names(tbl) <- make.unique(names(tbl), sep = "_")
+  nms <- tolower(names(tbl))
+  yr <- which(str_detect(nms, "^year$|year"))[1]
+  if (is.na(yr)) yr <- 1L
+  pop <- which(str_detect(nms, "^population$|pop|total"))[1]
+  if (is.na(pop)) pop <- setdiff(seq_along(nms), yr)[1]
+  out <- data.frame(
+    year = parse_number(as.character(tbl[[yr]])),
+    population_count = parse_number(as.character(tbl[[pop]]))
+  )
+  out <- out[!is.na(out$year) & !is.na(out$population_count), , drop = FALSE]
+  out[order(out$year), , drop = FALSE]
+}
+
+
+yrs <- historical_clean$year
+east_cols <- lapply(east_c, function(t) {
+  x <- get_population_table(t)
+  x$population_count[match(yrs, x$year)]
+})
+col_names <- gsub(",_Chicago$", "", east_c)
+historical_extended <- cbind(historical_clean, setNames(as.data.frame(east_cols), col_names))
+historical_extended
+```
+
+## Scraping and Analyzing Text Data
+
+Suppose we wanted to take the actual text from the Wikipedia pages instead of just the information in the table. Our goal in this section is to extract the text from the body of the pages, then do some basic text cleaning and analysis.
+
+First, scrape just the text without any of the information in the margins or headers. For example, for "Grand Boulevard", the text should start with, "**Grand Boulevard** on the [South Side](https://en.wikipedia.org/wiki/South_Side,_Chicago "South Side, Chicago") of [Chicago](https://en.wikipedia.org/wiki/Chicago "Chicago"), [Illinois](https://en.wikipedia.org/wiki/Illinois "Illinois"), is one of the ...". Make sure all of the text is in one block by using something like the code below (I called my object `description`).
+
+```{r}
+scrape <- function(page_title) {
+  url  <- paste0("https://en.wikipedia.org/wiki/", page_title)
+  html <- read_html(url)
+  nodes <- html |>
+    html_elements("#mw-content-text .mw-parser-output > p")
+  txt <- nodes |> html_text2()
+  paste(txt, collapse = " ")
+}
+
+description <- scrape("Grand_Boulevard,_Chicago")
+description
+```
+
+Using a similar loop as in the last section, grab the descriptions of the various communities areas. Make a tibble with two columns: the name of the location and the text describing the location.
+
+```{r}
+areas <- tables_nodes[[5]] |>
+  html_elements("tr > td:nth-child(2) a") |>
+  html_text2() |>
+  str_remove_all("\\[[^\\]]*\\]") |>
+  str_squish() |>
+  unique()
+
+pages <- paste0(areas, ", Chicago") |>
+  str_replace_all("\\s+", "_")
+
+descriptions <- tibble(location = character(), text = character())
+
+for (loc in pages) {
+  page_text <- scrape(loc)
+  clean_name <- str_replace_all(loc, "_", " ") |> str_remove(", Chicago$")
+  descriptions <- add_row(descriptions, location = clean_name, text = page_text)
+}
+
+descriptions
+```
+
+Let's clean the data using `tidytext`. If you have trouble with this section, see the example shown in [https://www.tidytextmining.com/tidytext.htm](https://www.tidytextmining.com/tidytext.html){.uri}l
+
+Create tokens using `unnest_tokens`. Make sure the data is in one-token-per-row format. Remove any stop words within the data. What are the most common words used overall?
+
+```{r}
+library(tidytext)
+
+clean_text <- descriptions |>
+  unnest_tokens(word, text) |>             
+  anti_join(stop_words, by = "word") |>
+  mutate(word = str_remove_all(word, "\\d+")) |>
+  mutate(word = str_remove_all(word, "[[:punct:]]")) |>
+  filter(str_length(word) > 1) |>
+  count(word, sort = TRUE) |>
+  ungroup()
+
+clean_text
+```
+
+The most common words used overall are 'chicago', 'park', and 'community.
+
+**Plot the most common words within each location. What are some of the similarities between the locations? What are some of the differences?**
+
+```{r}
+location_clean <- descriptions |>
+  unnest_tokens(word, text) |>             
+  anti_join(stop_words, by = "word") |>
+  mutate(word = str_remove_all(word, "\\d+")) |>
+  mutate(word = str_remove_all(word, "[[:punct:]]")) |>
+  filter(str_length(word) > 1) |>
+  group_by(location)|> 
+  count(word, sort = TRUE) |>
+  ungroup()
+
+common_words <- location_clean |>
+  group_by(location) |>
+  slice_max(n, n = 10) |>
+  ungroup()
+
+plot<- ggplot(common_words, aes(x = word, y = n, fill = location)) +
+  geom_col(show.legend = FALSE) +
+  scale_x_reordered() +
+  labs(
+    title = "Most Common Words by Location") +
+  facet_wrap(~location, scales = "free_y")+
+  coord_flip()+
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+#| fig.width: 20
+#| fig.height: 50
+#| out.width: 100%
+plot
+
+```
+
+Locations similarly use words like 'chicago', 'neighborhood', 'community' and 'park' within their Wikipedia pages quite often. Most of the differences are in references to specific place names; typically the most common referred to word in each page is the name of the location, which varies from place to place. References to specific streets are typically unique as well.
